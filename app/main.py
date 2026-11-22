@@ -16,6 +16,9 @@ from .schemas import (
     FormOut,
     HealthOut,
     ImportReceiptOut,
+    PairTrackingClearOut,
+    PairTrackingIn,
+    PairTrackingSummaryOut,
     QuestionOut,
     ReviewMutationOut,
     ReviewRegisterIn,
@@ -50,13 +53,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="打乱卷型单选测验 · 答项统计 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "扫描答卷只记录卷面题号与印刷选项标记，卷型丢失时用复核记录反推。\n\n"
         "- 候选卷型：符合该卷 **全部** 复核记录的卷型。\n"
         "- 只统计全部候选卷型都还原为同一标准选项的题目。\n"
         "- 无候选卷型时整卷待核，不参与任何题目的分布。\n"
-        "- 登记/撤回复核只重算该卷，并与逐卷结果、题目计数在同一事务内生效。"
+        "- 登记/撤回复核只重算该卷，并与逐卷结果、题目计数在同一事务内生效。\n"
+        "- 错答同卷跟踪：选定两道标准题及各自目标选项后，按候选卷型汇总"
+        "「选了前一题目标选项的答卷中也选后一题目标选项」的比例范围；"
+        "复核增撤只增量更新该卷对汇总的影响。"
     ),
     lifespan=lifespan,
 )
@@ -149,6 +155,7 @@ def recompute_all(db_path: DbPath) -> dict[str, int]:
         for row in rows:
             engine.recompute_sheet(conn, row["id"], at)
         engine.rebuild_all_counts(conn)
+        engine.rebuild_pair_summary(conn)
         return {
             "questions": conn.execute(
                 "SELECT COUNT(*) AS n FROM standard_questions"
@@ -303,3 +310,77 @@ def get_question_stats(
     question_id: Annotated[str, Path(min_length=1, max_length=100)], db_path: DbPath
 ) -> dict:
     return {"questions": _read(db_path, lambda conn: service.get_stats(conn, question_id))}
+
+
+# ---------------------------------------------------------------------------
+# Wrong-answer pair tracking
+# ---------------------------------------------------------------------------
+
+
+@app.put(
+    "/pair-tracking",
+    response_model=PairTrackingSummaryOut,
+    tags=["pair-tracking"],
+    summary="设置（或替换）错答同卷跟踪：两道标准题及各自目标选项，一次只跟踪一组",
+)
+def set_pair_tracking(
+    payload: Annotated[PairTrackingIn, Body(...)], db_path: DbPath
+) -> dict:
+    def work(conn):
+        if payload.first_question_id == payload.second_question_id:
+            raise bad_request("两道标准题必须不同")
+        for question_id, option_id in (
+            (payload.first_question_id, payload.first_option_id),
+            (payload.second_question_id, payload.second_option_id),
+        ):
+            question = conn.execute(
+                "SELECT id FROM standard_questions WHERE id = ?", (question_id,)
+            ).fetchone()
+            if question is None:
+                raise not_found(f"question {question_id!r} not found")
+            option = conn.execute(
+                "SELECT id FROM standard_options WHERE id = ? AND question_id = ?",
+                (option_id, question_id),
+            ).fetchone()
+            if option is None:
+                raise bad_request(
+                    f"option {option_id!r} does not belong to question {question_id!r}"
+                )
+        engine.set_pair_tracking(
+            conn,
+            engine.PairTracking(
+                first_question_id=payload.first_question_id,
+                first_option_id=payload.first_option_id,
+                second_question_id=payload.second_question_id,
+                second_option_id=payload.second_option_id,
+            ),
+            engine.now_iso(),
+        )
+        return service.get_pair_tracking(conn)
+
+    return _write(db_path, work)
+
+
+@app.get(
+    "/pair-tracking",
+    response_model=PairTrackingSummaryOut,
+    tags=["pair-tracking"],
+    summary="查询当前跟踪：选了前一题目标选项的答卷中也选后一题目标选项的比例范围（直接读汇总）",
+)
+def get_pair_tracking(db_path: DbPath) -> dict:
+    return _read(db_path, service.get_pair_tracking)
+
+
+@app.delete(
+    "/pair-tracking",
+    response_model=PairTrackingClearOut,
+    tags=["pair-tracking"],
+    summary="撤回跟踪：清空跟踪设置与汇总",
+)
+def clear_pair_tracking(db_path: DbPath) -> dict:
+    def work(conn):
+        if not engine.clear_pair_tracking(conn):
+            raise not_found("当前没有跟踪设置")
+        return {"cleared": True}
+
+    return _write(db_path, work)

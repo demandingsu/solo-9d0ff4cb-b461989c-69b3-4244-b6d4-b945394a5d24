@@ -348,6 +348,225 @@ def _reverse_lookup(printed_by_option: dict[str, str], label: str) -> str | None
 
 
 # ---------------------------------------------------------------------------
+# Wrong-answer pair tracking (same-sheet co-occurrence of two target options)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PairTracking:
+    """The tracked pair: two standard questions and their target options."""
+
+    first_question_id: str
+    first_option_id: str
+    second_question_id: str
+    second_option_id: str
+
+
+def load_pair_tracking(conn: sqlite3.Connection) -> PairTracking | None:
+    row = conn.execute(
+        "SELECT first_question_id, first_option_id, second_question_id, second_option_id "
+        "FROM pair_tracking WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return None
+    return PairTracking(
+        first_question_id=row["first_question_id"],
+        first_option_id=row["first_option_id"],
+        second_question_id=row["second_question_id"],
+        second_option_id=row["second_option_id"],
+    )
+
+
+def _restore_option(form: FormDef, question_id: str, answers: dict[int, str]) -> str | None:
+    """Translate the scan to a standard option under one form, or ``None``."""
+
+    mapping = form.questions.get(question_id)
+    if mapping is None:
+        return None
+    paper_no, printed = mapping
+    label = answers.get(paper_no)
+    if label is None:
+        return None
+    return _reverse_lookup(printed, label)
+
+
+def compute_pair_rows(
+    catalog: DbCatalog,
+    tracking: PairTracking,
+    candidate_form_ids: list[str],
+    answers: dict[int, str],
+) -> list[tuple[str, int, int]]:
+    """Feasible (sheet, form) rows for one sheet.
+
+    The same candidate form restores both questions; only combinations where
+    both restore are kept.  Each row is ``(form_id, first_hit, second_hit)``.
+    """
+
+    rows: list[tuple[str, int, int]] = []
+    for form_id in candidate_form_ids:
+        form = catalog.form_by_id.get(form_id)
+        if form is None:
+            continue
+        first = _restore_option(form, tracking.first_question_id, answers)
+        if first is None:
+            continue
+        second = _restore_option(form, tracking.second_question_id, answers)
+        if second is None:
+            continue
+        rows.append(
+            (
+                form_id,
+                1 if first == tracking.first_option_id else 0,
+                1 if second == tracking.second_option_id else 0,
+            )
+        )
+    return rows
+
+
+def persist_pair_rows(
+    conn: sqlite3.Connection, sheet_id: str, rows: list[tuple[str, int, int]]
+) -> None:
+    conn.execute("DELETE FROM pair_sheet_forms WHERE sheet_id = ?", (sheet_id,))
+    conn.executemany(
+        "INSERT INTO pair_sheet_forms (sheet_id, form_id, first_hit, second_hit) "
+        "VALUES (?, ?, ?, ?)",
+        [(sheet_id, form_id, first_hit, second_hit) for form_id, first_hit, second_hit in rows],
+    )
+
+
+def load_pair_rows(conn: sqlite3.Connection, sheet_id: str) -> list[tuple[str, int, int]]:
+    return [
+        (row["form_id"], row["first_hit"], row["second_hit"])
+        for row in conn.execute(
+            "SELECT form_id, first_hit, second_hit FROM pair_sheet_forms WHERE sheet_id = ?",
+            (sheet_id,),
+        ).fetchall()
+    ]
+
+
+def _aggregate_pair_rows(rows: list[tuple[str, int, int]]) -> dict[str, tuple[int, int, int]]:
+    """(form_id -> (feasible, denominator, numerator)) for a sheet's rows."""
+
+    aggregated: dict[str, tuple[int, int, int]] = {}
+    for form_id, first_hit, second_hit in rows:
+        feasible, denominator, numerator = aggregated.get(form_id, (0, 0, 0))
+        aggregated[form_id] = (
+            feasible + 1,
+            denominator + first_hit,
+            numerator + (1 if first_hit and second_hit else 0),
+        )
+    return aggregated
+
+
+def apply_pair_delta(
+    conn: sqlite3.Connection,
+    old_rows: list[tuple[str, int, int]],
+    new_rows: list[tuple[str, int, int]],
+) -> None:
+    """Adjust the pair summary by one sheet's difference (old -> new rows)."""
+
+    old = _aggregate_pair_rows(old_rows)
+    new = _aggregate_pair_rows(new_rows)
+    for form_id in sorted(set(old) | set(new)):
+        before = old.get(form_id, (0, 0, 0))
+        after = new.get(form_id, (0, 0, 0))
+        if before == after:
+            continue
+        if before != (0, 0, 0):
+            updated = conn.execute(
+                "UPDATE pair_form_summary "
+                "SET feasible = feasible - ?, denominator = denominator - ?, "
+                "    numerator = numerator - ? "
+                "WHERE form_id = ? AND feasible >= ? AND denominator >= ? AND numerator >= ?",
+                (*before, form_id, *before),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    f"pair summary underflow for form {form_id}; refusing inconsistent data"
+                )
+            conn.execute(
+                "DELETE FROM pair_form_summary "
+                "WHERE form_id = ? AND feasible = 0 AND denominator = 0 AND numerator = 0",
+                (form_id,),
+            )
+        if after != (0, 0, 0):
+            conn.execute(
+                "INSERT INTO pair_form_summary (form_id, feasible, denominator, numerator) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(form_id) DO UPDATE SET "
+                "feasible = feasible + excluded.feasible, "
+                "denominator = denominator + excluded.denominator, "
+                "numerator = numerator + excluded.numerator",
+                (form_id, *after),
+            )
+
+
+def rebuild_pair_rows(conn: sqlite3.Connection, tracking: PairTracking) -> None:
+    """Recompute every sheet's feasible combinations from persisted results."""
+
+    catalog = DbCatalog.load(conn)
+    conn.execute("DELETE FROM pair_sheet_forms")
+    for row in conn.execute(
+        "SELECT sheet_id, candidate_form_ids FROM sheet_results"
+    ).fetchall():
+        candidates = json.loads(row["candidate_form_ids"])
+        answers = {
+            answer["paper_no"]: answer["printed_label"]
+            for answer in conn.execute(
+                "SELECT paper_no, printed_label FROM sheet_answers WHERE sheet_id = ?",
+                (row["sheet_id"],),
+            ).fetchall()
+        }
+        persist_pair_rows(
+            conn, row["sheet_id"], compute_pair_rows(catalog, tracking, candidates, answers)
+        )
+
+
+def rebuild_pair_summary(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM pair_form_summary")
+    conn.execute(
+        "INSERT INTO pair_form_summary (form_id, feasible, denominator, numerator) "
+        "SELECT form_id, COUNT(*), SUM(first_hit), "
+        "       SUM(CASE WHEN first_hit = 1 AND second_hit = 1 THEN 1 ELSE 0 END) "
+        "FROM pair_sheet_forms GROUP BY form_id"
+    )
+
+
+def set_pair_tracking(conn: sqlite3.Connection, tracking: PairTracking, updated_at: str) -> None:
+    """Replace the tracked pair and rebuild the derived rows and summary."""
+
+    conn.execute(
+        "INSERT INTO pair_tracking "
+        "(id, first_question_id, first_option_id, second_question_id, second_option_id, updated_at) "
+        "VALUES (1, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "first_question_id = excluded.first_question_id, "
+        "first_option_id = excluded.first_option_id, "
+        "second_question_id = excluded.second_question_id, "
+        "second_option_id = excluded.second_option_id, "
+        "updated_at = excluded.updated_at",
+        (
+            tracking.first_question_id,
+            tracking.first_option_id,
+            tracking.second_question_id,
+            tracking.second_option_id,
+            updated_at,
+        ),
+    )
+    rebuild_pair_rows(conn, tracking)
+    rebuild_pair_summary(conn)
+
+
+def clear_pair_tracking(conn: sqlite3.Connection) -> bool:
+    """Drop the tracked pair together with its derived rows and summary."""
+
+    deleted = conn.execute("DELETE FROM pair_tracking WHERE id = 1")
+    conn.execute("DELETE FROM pair_sheet_forms")
+    conn.execute("DELETE FROM pair_form_summary")
+    return deleted.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
 # Persistence (must be called inside a write transaction)
 # ---------------------------------------------------------------------------
 
@@ -438,6 +657,13 @@ def recompute_sheet(conn: sqlite3.Connection, sheet_id: str, computed_at: str) -
         reviews=reviews,
     )
     persist_sheet_result(conn, resolved, computed_at)
+    tracking = load_pair_tracking(conn)
+    pair_rows = (
+        compute_pair_rows(catalog, tracking, resolved["candidate_form_ids"], answers)
+        if tracking is not None
+        else []
+    )
+    persist_pair_rows(conn, sheet_id, pair_rows)
     return resolved
 
 
@@ -502,6 +728,7 @@ def apply_review_change(
         raise KeyError(sheet_id)
 
     old_counted = load_counted_map(conn, sheet_id)
+    old_pair_rows = load_pair_rows(conn, sheet_id)
 
     if option_id is None:
         deleted = conn.execute(
@@ -522,6 +749,7 @@ def apply_review_change(
 
     resolved = recompute_sheet(conn, sheet_id, computed_at)
     apply_count_delta(conn, old_counted, resolved["counted_options"])
+    apply_pair_delta(conn, old_pair_rows, load_pair_rows(conn, sheet_id))
     return resolved
 
 
@@ -536,6 +764,9 @@ def replace_dataset(
     """Replace the whole working dataset and rebuild every derived row."""
 
     for table in (
+        "pair_form_summary",
+        "pair_sheet_forms",
+        "pair_tracking",
         "question_option_counts",
         "sheet_question_results",
         "sheet_results",

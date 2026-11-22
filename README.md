@@ -8,6 +8,9 @@
 - 只有所有候选卷型都还原出**同一标准选项**的题，才进入答项分布。
 - 没有候选卷型时整卷待核，该卷不贡献任何一道题的计数。
 - 登记 / 撤回复核只重算该卷；复核记录、逐卷结果和题目计数在同一事务里提交。
+- 错答同卷跟踪：选定两道标准题及各自的目标选项后，按候选卷型汇总
+  「选了前一题目标选项的答卷中，也选了后一题目标选项」的比例范围，
+  帮助教研员判断两种错答是否常出现在同一份卷上。
 
 ## 快速开始（Docker Compose）
 
@@ -34,8 +37,25 @@ docker compose up --build
 | PUT | `/sheets/{id}/reviews/{question_id}` | 登记 / 覆盖一道标准题的实际选项 |
 | DELETE | `/sheets/{id}/reviews/{question_id}` | 撤回该题的复核 |
 | GET | `/stats`、`/stats/{question_id}` | 各标准题的答项计数 |
-| POST | `/admin/import` | 用完整数据集替换全部内容并全量重算 |
+| PUT | `/pair-tracking` | 设置（或替换）错答同卷跟踪：两道标准题及各自目标选项，一次只跟踪一组 |
+| GET | `/pair-tracking` | 查询跟踪汇总：各卷型下「选前一题目标选项 ⇒ 也选后一题目标选项」的比例及最低/最高范围 |
+| DELETE | `/pair-tracking` | 撤回跟踪，清空设置与汇总 |
+| POST | `/admin/import` | 用完整数据集替换全部内容并全量重算（同时清空跟踪设置与汇总） |
 | POST | `/admin/recompute` | 依据现有数据全量重算（修复用） |
+
+### 错答同卷跟踪
+
+- 一次只跟踪一组：前一题 + 目标选项，后一题 + 目标选项（两题必须不同）。
+- 对每份答卷，用**同一个候选卷型**还原两道题；两题都能还原的
+  （答卷 × 卷型）组合才是「可行组合」，整卷待核的答卷不参与。
+- 按卷型汇总：分母 = 该卷型可行组合中前一题还原为目标选项的数量，
+  分子 = 其中后一题也还原为目标选项的数量。
+- 比例范围只从**分母大于零**的卷型中取最低和最高（并列卷型一并列出）；
+  分母始终为零时返回 `zero_denominator_reason` 说明原因
+  （无答卷 / 无可行组合 / 无人选前一题目标选项）。
+- 查询只读维护好的汇总表；登记 / 撤回复核时只按该卷的差量更新汇总，
+  并与逐卷结果、答项计数在同一事务内生效。
+- 整库导入成功后清空跟踪设置与汇总；设置或写入失败时保留原数据。
 
 ### 演示步骤
 
@@ -55,6 +75,21 @@ curl -s -X PUT localhost:8000/sheets/S003/reviews/Q1 \
 curl -s localhost:8000/stats/Q1 | python3 -m json.tool
 curl -s -X DELETE localhost:8000/sheets/S003/reviews/Q1 | python3 -m json.tool
 curl -s localhost:8000/stats/Q1 | python3 -m json.tool
+
+# 5. 设置错答同卷跟踪：Q1 选 A 的答卷中，Q2 也选 B 的比例范围
+curl -s -X PUT localhost:8000/pair-tracking \
+     -H 'content-type: application/json' \
+     -d '{"first_question_id":"Q1","first_option_id":"Q1-A",
+          "second_question_id":"Q2","second_option_id":"Q2-B"}' | python3 -m json.tool
+
+# 6. 查询汇总（各卷型比例 + 最低/最高范围）
+curl -s localhost:8000/pair-tracking | python3 -m json.tool
+
+# 7. 登记复核后范围随之收窄（S003 的候选卷型从 4 个收敛到 3 个）
+curl -s -X PUT localhost:8000/sheets/S003/reviews/Q1 \
+     -H 'content-type: application/json' \
+     -d '{"option_id":"Q1-A","reviewer":"alice"}' | python3 -m json.tool
+curl -s localhost:8000/pair-tracking | python3 -m json.tool
 ```
 
 ### 卷状态
@@ -73,16 +108,22 @@ curl -s localhost:8000/stats/Q1 | python3 -m json.tool
 - `reviews`：按 (答卷, 标准题) 的唯一有效复核；撤回即删除。
 - `sheet_results` / `sheet_question_results`：缓存的逐卷与逐题结果。
 - `question_option_counts`：题目 × 选项的累计计数。
+- `pair_tracking`：单行跟踪设置（两道标准题 + 各自目标选项）。
+- `pair_sheet_forms`：可行（答卷 × 卷型）组合——同一候选卷型下两题都能还原，
+  并记录各自是否命中目标选项。
+- `pair_form_summary`：按卷型维护的可行数 / 分母 / 分子汇总，查询直接读它。
 
 计数采用增量维护：每次复核变更在事务里读取该卷旧的计入项，重算后只按差量
-调整 `question_option_counts`，因此单卷复核不会触碰其它卷。
+调整 `question_option_counts`，因此单卷复核不会触碰其它卷。错答同卷汇总同理：
+复核变更只按该卷旧 / 新可行组合的差量调整 `pair_form_summary`，
+与逐卷结果、答项计数在同一事务提交。
 
 ## 一致性设计
 
 - 每个请求独立 SQLite 连接，写操作使用 `BEGIN IMMEDIATE`，由 SQLite 写锁串行化；
   `busy_timeout` 默认 15s，并对 `SQLITE_BUSY` 做指数退避重试。
-- 一次复核变更 = 写/删复核 + 重算该卷结果 + 调整计数，同一事务提交。任一步失败
-  整体回滚，接口返回 503，原复核、原结果、原计数保持不变。
+- 一次复核变更 = 写/删复核 + 重算该卷结果 + 调整计数与错答同卷汇总，同一事务
+  提交。任一步失败整体回滚，接口返回 503，原复核、原结果、原计数与原汇总保持不变。
 - 并发复核按「已提交的全部复核记录」出数：后来者读到的复核证据已经包含先提交者，
   计数用差量更新而非「读-改-写」绝对值，不会丢更新。
 - 读取在 `BEGIN` 事务内完成，保证多表结果来自同一快照。

@@ -256,3 +256,123 @@ def get_pending(conn: sqlite3.Connection, sheet_id: str) -> dict[str, Any]:
         "status": detail["result"]["status"],
         "pending_reasons": detail["result"]["pending_reasons"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Wrong-answer pair tracking
+# ---------------------------------------------------------------------------
+
+
+def _pair_target(conn: sqlite3.Connection, question_id: str, option_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT q.prompt AS prompt, o.label AS label, o.text AS text "
+        "FROM standard_options o JOIN standard_questions q ON q.id = o.question_id "
+        "WHERE o.id = ? AND o.question_id = ?",
+        (option_id, question_id),
+    ).fetchone()
+    if row is None:  # pragma: no cover - the tracking row holds FK references
+        raise RuntimeError(f"tracked option {option_id!r} missing from catalog")
+    return {
+        "question_id": question_id,
+        "question_prompt": row["prompt"],
+        "option_id": option_id,
+        "option_label": row["label"],
+        "option_text": row["text"],
+    }
+
+
+def get_pair_tracking(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Current tracked pair plus the precomputed per-form summary.
+
+    Only the maintained summary tables are read; nothing is recomputed here.
+    """
+
+    setting = conn.execute(
+        "SELECT first_question_id, first_option_id, second_question_id, second_option_id, "
+        "       updated_at "
+        "FROM pair_tracking WHERE id = 1"
+    ).fetchone()
+    if setting is None:
+        raise not_found("尚未设置错答同卷跟踪，请先 PUT /pair-tracking")
+
+    summary = {
+        row["form_id"]: row
+        for row in conn.execute(
+            "SELECT form_id, feasible, denominator, numerator FROM pair_form_summary"
+        ).fetchall()
+    }
+
+    forms: list[dict[str, Any]] = []
+    feasible_total = 0
+    min_prop: float | None = None
+    max_prop: float | None = None
+    min_form_ids: list[str] = []
+    max_form_ids: list[str] = []
+    for form in conn.execute(
+        "SELECT id, name FROM forms ORDER BY display_order, id"
+    ).fetchall():
+        row = summary.get(form["id"])
+        feasible = row["feasible"] if row is not None else 0
+        denominator = row["denominator"] if row is not None else 0
+        numerator = row["numerator"] if row is not None else 0
+        feasible_total += feasible
+        proportion = (numerator / denominator) if denominator > 0 else None
+        forms.append(
+            {
+                "form_id": form["id"],
+                "form_name": form["name"],
+                "feasible_sheets": feasible,
+                "denominator": denominator,
+                "numerator": numerator,
+                "proportion": proportion,
+            }
+        )
+        if proportion is not None:
+            if min_prop is None or proportion < min_prop:
+                min_prop, min_form_ids = proportion, [form["id"]]
+            elif proportion == min_prop:
+                min_form_ids.append(form["id"])
+            if max_prop is None or proportion > max_prop:
+                max_prop, max_form_ids = proportion, [form["id"]]
+            elif proportion == max_prop:
+                max_form_ids.append(form["id"])
+
+    if min_prop is None:
+        proportion_range = None
+        total_sheets = conn.execute("SELECT COUNT(*) AS n FROM sheets").fetchone()["n"]
+        if total_sheets == 0:
+            zero_reason = "当前没有任何答卷，无法形成可行（答卷 × 卷型）组合"
+        elif feasible_total == 0:
+            zero_reason = (
+                "没有任何（答卷 × 卷型）组合能同时还原这两道题"
+                "（答卷整卷待核，或题目在候选卷型下缺少作答 / 无法识别印刷标记）"
+            )
+        else:
+            zero_reason = (
+                f"共有 {feasible_total} 个可行（答卷 × 卷型）组合，但没有答卷在任何候选卷型下"
+                f"选了前一题的目标选项 {setting['first_option_id']}，分母始终为零"
+            )
+    else:
+        proportion_range = {
+            "min": min_prop,
+            "max": max_prop,
+            "min_form_ids": min_form_ids,
+            "max_form_ids": max_form_ids,
+        }
+        zero_reason = None
+
+    return {
+        "tracking": {
+            "first": _pair_target(
+                conn, setting["first_question_id"], setting["first_option_id"]
+            ),
+            "second": _pair_target(
+                conn, setting["second_question_id"], setting["second_option_id"]
+            ),
+            "updated_at": setting["updated_at"],
+        },
+        "feasible_combinations": feasible_total,
+        "forms": forms,
+        "proportion_range": proportion_range,
+        "zero_denominator_reason": zero_reason,
+    }

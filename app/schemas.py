@@ -78,6 +78,66 @@ class ReviewRegisterIn(_Base):
 
 
 # ---------------------------------------------------------------------------
+# Wrong-answer pair tracking
+# ---------------------------------------------------------------------------
+
+
+class PairTrackingIn(_Base):
+    """The tracked pair: two standard questions and their target options."""
+
+    first_question_id: str = Field(min_length=1, max_length=100)
+    first_option_id: str = Field(min_length=1, max_length=100)
+    second_question_id: str = Field(min_length=1, max_length=100)
+    second_option_id: str = Field(min_length=1, max_length=100)
+
+
+class PairTargetOut(BaseModel):
+    question_id: str
+    question_prompt: str
+    option_id: str
+    option_label: str
+    option_text: str
+
+
+class PairTrackingOut(BaseModel):
+    first: PairTargetOut
+    second: PairTargetOut
+    updated_at: str
+
+
+class PairFormStatOut(BaseModel):
+    """Per-form summary: among feasible (sheet x form) combinations, how many
+    restored the first question to its target option (denominator) and how
+    many of those also restored the second (numerator)."""
+
+    form_id: str
+    form_name: str
+    feasible_sheets: int
+    denominator: int
+    numerator: int
+    proportion: float | None
+
+
+class PairProportionRangeOut(BaseModel):
+    min: float
+    max: float
+    min_form_ids: list[str]
+    max_form_ids: list[str]
+
+
+class PairTrackingSummaryOut(BaseModel):
+    tracking: PairTrackingOut
+    feasible_combinations: int
+    forms: list[PairFormStatOut]
+    proportion_range: PairProportionRangeOut | None
+    zero_denominator_reason: str | None
+
+
+class PairTrackingClearOut(BaseModel):
+    cleared: bool
+
+
+# ---------------------------------------------------------------------------
 # Catalog
 # ---------------------------------------------------------------------------
 

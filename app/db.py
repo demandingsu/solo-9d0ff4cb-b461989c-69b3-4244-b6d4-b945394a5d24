@@ -141,6 +141,42 @@ CREATE TABLE IF NOT EXISTS question_option_counts (
         REFERENCES standard_options(id, question_id)
 );
 
+-- Singleton setting (id = 1): the tracked pair of standard questions and
+-- their target options.  Only one pair is tracked at a time.
+CREATE TABLE IF NOT EXISTS pair_tracking (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    first_question_id   TEXT NOT NULL,
+    first_option_id     TEXT NOT NULL,
+    second_question_id  TEXT NOT NULL,
+    second_option_id    TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    FOREIGN KEY (first_option_id, first_question_id)
+        REFERENCES standard_options(id, question_id),
+    FOREIGN KEY (second_option_id, second_question_id)
+        REFERENCES standard_options(id, question_id)
+);
+
+-- Feasible (sheet x form) combinations for the tracked pair: under this
+-- candidate form both questions restore to a standard option.  Rebuilt per
+-- sheet whenever the sheet is recomputed while tracking is active.
+CREATE TABLE IF NOT EXISTS pair_sheet_forms (
+    sheet_id    TEXT NOT NULL REFERENCES sheets(id) ON DELETE CASCADE,
+    form_id     TEXT NOT NULL,
+    first_hit   INTEGER NOT NULL CHECK (first_hit IN (0, 1)),
+    second_hit  INTEGER NOT NULL CHECK (second_hit IN (0, 1)),
+    PRIMARY KEY (sheet_id, form_id)
+);
+
+-- Incrementally maintained per-form summary.  Queries read only this table.
+CREATE TABLE IF NOT EXISTS pair_form_summary (
+    form_id     TEXT PRIMARY KEY,
+    feasible    INTEGER NOT NULL DEFAULT 0 CHECK (feasible >= 0),
+    denominator INTEGER NOT NULL DEFAULT 0 CHECK (denominator >= 0),
+    numerator   INTEGER NOT NULL DEFAULT 0 CHECK (numerator >= 0),
+    CHECK (denominator <= feasible),
+    CHECK (numerator <= denominator)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sheet_question_results_counted
     ON sheet_question_results(sheet_id, counted);
 CREATE INDEX IF NOT EXISTS idx_sheet_results_status
